@@ -4,13 +4,22 @@
 
 | Platform | Runtime | Operators | Qwen2 inference | Status |
 | --- | --- | --- | --- | --- |
-| CPU (x86_64) | Passed | Passed | Passed | Supported |
+| CPU (Linux, GCC) | Passed | Passed | Passed | Supported |
+| CPU (Windows, MSVC 2022) | Passed | Passed | Not run locally (CI) | Supported |
 | NVIDIA RTX 4090 | Passed | Passed | Passed | Supported |
 | MetaX C500 | Passed | Passed | Passed | Supported |
 
 Operator coverage includes Float32, Float16, and BFloat16 on every platform. The
 Qwen2 pipeline (loader, KV-cache decode, and the 128-step exact-match generation
-test) passes on all three backends.
+test) passes on CPU, NVIDIA, and MetaX.
+
+Windows is listed separately because it is a distinct compiler, not just a
+distinct OS: MSVC implements OpenMP 2.0, which rejects `collapse` and requires a
+signed loop index, so all five OpenMP CPU kernels failed to compile there while
+building cleanly under GCC. CI builds on `windows-latest`, so this was a real
+break rather than a portability nicety. It was found by reproducing the CI build
+locally with MSVC 2022 and is fixed; runtime, tensor, and all eight operator
+suites now pass on Windows/CPU.
 
 ## Architecture
 
@@ -195,8 +204,9 @@ Both runs reproduce the figures reported above from clean checkouts.
   synchronous device-to-device copies per layer and inference step.
 - Single-token decoding uses fused attention without a global score buffer or
   per-layer `cudaMalloc`/`cudaFree`.
-- CUDA argmax uses a 256-thread block reduction instead of scanning the
-  151,936-element vocabulary with one thread.
+- CUDA argmax uses a block reduction instead of scanning the 151,936-element
+  vocabulary with one thread. (This first version still used a single block; the
+  two-stage rewrite is described under profile-guided optimization below.)
 - Cache and workspace storage resize to the current request and release the old
   allocation before growing or shrinking, avoiding retained high-water memory
   and overlapping old/new allocations.
@@ -209,6 +219,215 @@ Additional regression coverage includes the model's real decode geometry
 (`12` query heads, `2` KV heads, head dimension `128`) at KV lengths `1`, `256`,
 and `257`, a two-layer Qwen2 reference model, cache shrink/grow reuse, duplicate
 maxima, NaNs, and the real `151,936`-element vocabulary.
+
+## Correctness and API-robustness pass
+
+Five issues were found by reading the tree against its own claims, and fixed
+before any performance work, since each one either invalidated a test result or
+made a failure unreportable.
+
+| Issue | Why it mattered | Fix |
+| --- | --- | --- |
+| `test/ops/embedding.py` called `check_equal` without `assert` | `check_equal` returns a bool, so this test printed mismatches and still exited 0 — it was structurally incapable of failing, while the report claimed all operator cases passed | Added the `assert`, matching the other seven suites |
+| `python/llaisys/runtime.py` had a debug `print` on every device free | Wrote a line to stdout per deallocation | Removed |
+| No `try`/`catch` anywhere on the `extern "C"` boundary | Every exported function could throw (`CHECK_ARGUMENT` raises `std::runtime_error`); an exception unwinding through the C ABI into ctypes is undefined behavior, so one out-of-range token could abort the Python process instead of raising something catchable | Added an error-translation layer (below) |
+| `generate()` accepted `temperature`/`top_p`/`top_k` and discarded them | The signature promised sampling; the backend is greedy-only, so callers silently got greedy decoding and could believe otherwise | Non-greedy values now raise `ValueError` naming the expected value |
+| `ensure_workspace` compared capacity with `!=` | `ntoken` alternates between `prompt_len` and `1`, so every prefill/decode transition reallocated the entire workspace | Grows only when the request exceeds capacity, then slices to the actual length |
+
+### C ABI error translation
+
+`src/llaisys/error.{hpp,cc}` stores a thread-local message and wraps each entry
+point in `protect()`; `include/llaisys/error.h` exposes `llaisysGetLastError`;
+`python/llaisys/libllaisys/error.py` installs a ctypes `errcheck` that raises
+`LlaisysError`. All 32 exported functions route through `protect()`, so a C++
+exception becomes a Python exception instead of unwinding through the ABI.
+Verified on device:
+
+```
+PASS view element mismatch -> tensorView: View shape must preserve the number of elements
+PASS slice out of bounds   -> tensorSlice: Slice end is out of range
+PASS unimplemented stub    -> llaisysRearrange: Unimplemented function
+PASS shape mismatch add    -> llaisysAdd: Shapes mismatch
+process still alive -> no UB abort
+```
+
+### Teardown during CUDA runtime unload
+
+Every run printed `Failed to select device while destroying runtime: cudaSetDevice
+failed: driver shutting down` at exit. The cause is ordering: the CUDA runtime
+begins unloading before the thread-local `Context` is destroyed, so `cudaSetDevice`
+from `Runtime`'s destructor necessarily fails.
+
+Silencing the destructor's diagnostic would have hidden genuine leaks, so the
+distinction is made at the device layer instead. CUDA reports this specific
+condition as `cudaErrorCudartUnloading`, which means the runtime is already gone
+and the resource the call would have released no longer exists — the call is a
+successful no-op. `checkCudaTeardown` accepts only that status and defers
+everything else to the normal throwing check, so it is applied to the four
+teardown paths (`cudaSetDevice`, `cudaStreamDestroy`, `cudaFree`, `cudaFreeHost`)
+while real failures still report. The message is gone and the runtime, loader,
+and 128-step exact-match tests still pass.
+
+The equivalent MACA change was deliberately not made: the MetaX host was not
+reachable to confirm the enumerator's name, and guessing it would risk exactly
+the kind of unverified-platform build break described under platform status.
+
+## Profile-guided optimization
+
+### Measuring first: decode is memory-bound, not launch-bound
+
+The intuitive read on 400+ kernel launches per token is that decode is
+launch-bound. A decisive experiment — hold the launch count fixed and vary the
+work per launch, by running a single forward pass at different `ntoken` — says
+otherwise:
+
+| ntokens | ms | ms/token |
+| --- | --- | --- |
+| 1 | 4.927 | 4.927 |
+| 2 | 5.969 | 2.985 |
+| 8 | 6.015 | 0.752 |
+| 32 | 6.074 | 0.190 |
+| 64 | 6.609 | 0.103 |
+| 128 | 10.252 | 0.080 |
+
+Cost is nearly flat to `ntoken=64`, so a pass is dominated by a fixed term, not
+by arithmetic. That term is weight bandwidth: reading 3.56 GB of BF16 weights in
+4.93 ms is **722 GB/s, or 72% of the 4090's 1008 GB/s peak**. Measured empty-kernel
+launch latency is 2.36 µs, so 508 launches ≈ 1.2 ms, which hides behind 3.53 ms
+of real GPU work.
+
+This retired two planned optimizations before they were written — vectorizing
+`add`/`swiglu` and overlapping streams both target a bottleneck that does not
+exist here. It also identified the real targets, the two operators running far
+below achievable bandwidth:
+
+| op | achieved | cause |
+| --- | --- | --- |
+| `self_attention` (decode) | 128 KB / 28 µs = **4.5 GB/s** | 12 blocks on 128 SMs; each dot product recomputed across three passes (max, sum, output); GQA reread K/V per query head |
+| `argmax` (151,936) | 296 KB / 105 µs = **2.8 GB/s** | launched `<<<1, 256>>>` — a single block |
+
+At ~16% and ~2.1% of a decode step respectively, these were the only two
+operators where kernel work, rather than weight traffic, set the cost.
+
+### Kernel results
+
+| op | before | after | change |
+| --- | --- | --- | --- |
+| `argmax` (151,936) | 104.66 µs | **6.20 µs** | 17× — two-stage reduction, `<<<blocks, 256>>>` then one folding block. NaN and tie-breaking semantics preserved; a single-block path avoids regressing small inputs |
+| `rope` | 8.6 µs | 4.65 µs | 1.85× — one block per token computes each `(sin, cos)` pair once into shared memory instead of a `powf`+`sincosf` per output element |
+| `embedding` | 7.8 µs | 5.11 µs | 1.53× — one block per row, coalesced gather, **plus an out-of-bounds fix** (see below) |
+| `self_attention` (decode) | see curve | see curve | flash-decoding split-KV |
+
+The `embedding` change fixed a real bug, not just throughput. Indices live in
+device memory, so validating them on the host would need a device-to-host sync on
+the decode path; the old kernel therefore cast whatever it read to `size_t` and
+gathered, meaning a negative or out-of-range token id read out of bounds. The
+kernel now range-checks per row and zero-fills invalid rows. The out-of-bounds
+read was reproduced and confirmed fixed on device.
+
+### Flash-decoding split-KV attention
+
+`self_attention` took three attempts, and the first two are the useful part of
+the record. A single-pass rewrite and then a warp-shuffle reduction both left the
+op at ~6.8 GB/s *regardless of KV length* — a flat ceiling is the signature of an
+occupancy limit, not a memory or reduction one. The root cause was the launch
+geometry: one block per query head is **12 blocks on 128 SMs**, so 90% of the GPU
+sat idle no matter how efficient the block became.
+
+The fix is flash-decoding: split the key range into 512-element chunks so the
+grid becomes `query_heads * splits`, have each chunk emit its unnormalized
+partial output alongside its softmax statistics, and merge with the standard
+log-sum-exp rescale. At `kv=16384` that is 32 splits × 12 heads = 384 blocks.
+Below `kv=1024` the combine pass costs more than it saves, so the single-block
+decode kernel is kept for short contexts. A thread-local workspace holds the
+partials and grows monotonically instead of allocating per call.
+
+Correctness was checked against `torch.nn.functional.scaled_dot_product_attention`
+across the threshold, confirming both paths and that the switch is not a
+discontinuity:
+
+```
+kv=1023   split_path=False  match=True
+kv=1024   split_path=False  match=True
+kv=1025   split_path=True   match=True
+kv=1536   split_path=True   match=True
+kv=2048   split_path=True   match=True
+kv=3000   split_path=True   match=True
+kv=4096   split_path=True   match=True
+kv=8192   split_path=True   match=True
+```
+
+### End-to-end decode throughput vs context
+
+Attention is the one part of decode that grows with context, so a short-prompt
+benchmark hides it: at `kv=90` attention is ~13% of a token and a faster kernel
+barely moves the total. `test/benchmark_context.py` sweeps the starting context.
+Baseline here means this tree with the four pre-optimization kernels restored, so
+the comparison isolates the kernel work from every other change:
+
+| context | baseline ms/token | optimized ms/token | speedup |
+| --- | --- | --- | --- |
+| 128 | 5.442 ± 0.294 | 5.273 ± 0.091 | 1.03× |
+| 512 | 7.400 ± 0.161 | 6.713 ± 0.091 | 1.10× |
+| 1024 | 9.782 ± 0.324 | 6.597 ± 0.356 | 1.48× |
+| 2048 | 14.667 ± 0.225 | 7.244 ± 0.080 | 2.02× |
+| 4096 | 25.673 ± 0.257 | 8.461 ± 0.247 | 3.03× |
+| 8192 | 47.622 ± 0.576 | 8.455 ± 0.229 | 5.63× |
+| 16384 | 87.305 ± 1.300 | 8.192 ± 0.626 | **10.66×** |
+
+Baseline doubles its per-token cost with every doubling of context, as expected
+when attention is serialized on 12 blocks. The optimized curve is flat from 4096
+onward — 8.46, 8.46, and 8.19 ms/token at 4096, 8192, and 16384 agree within
+their uncertainties — so decode has returned to being bounded by weight
+bandwidth rather than by attention.
+
+### Benchmark methodology
+
+The first version of this benchmark reported 0.642 ms/token at context 16384, an
+11× *speedup* over its own 8192 result. That is physically impossible, and the
+cause was the measurement, not the kernels: per-step cost was recovered as
+`median(total) - median(prefill)`. At context 16384 prefill is ~29.8 s while 31
+decode steps are ~0.3 s, so the signal is 1% of the subtrahend and prefill jitter
+alone exceeds the entire quantity being measured. The difference went negative
+(-3.9 ms/token) and a `max(..., 0)` clamp turned that into a small positive
+number that looked like a fast reading.
+
+The benchmark now differences two generation runs of different length
+(`steps` and `2 * steps`) instead. Both runs pay the same prefill, so it cancels
+algebraically rather than numerically. Three guards make a future failure of this
+kind loud instead of silent:
+
+- Actual tokens generated is compared against tokens requested, so an EOS or
+  cache-limit truncation raises instead of averaging over steps that never ran.
+- Run-to-run spread is propagated and reported as `±` on every number.
+- A difference smaller than 3× the observed spread raises `UnreliableMeasurement`
+  rather than being reported. This fired at context 16384 with `--steps 32`,
+  which is why the long-context rows above were measured with `--steps 256`.
+
+Cross-checking the two methods on the same host shows the old approach was sound
+where the decode signal was large relative to prefill and degraded exactly where
+theory predicts:
+
+| context | prefill-subtraction | differencing | error |
+| --- | --- | --- | --- |
+| 128 | 5.230 | 5.302 | 1.4% |
+| 1024 | 6.561 | 6.619 | 0.9% |
+| 4096 | 8.429 | 8.368 | 0.7% |
+| 8192 | 9.241 | 8.218 | 12% |
+| 16384 | -3.878 | 9.676 | invalid |
+
+Conclusions at or below 4096 were unaffected; only the 8192 and 16384 rows
+needed re-measurement.
+
+### Supporting tools
+
+- `test/benchmark_infer.py` — prefill and decode reported separately, with
+  repeats and JSON output for before/after diffs.
+- `test/benchmark_ops.py` — per-operator microseconds at Qwen2 decode geometry,
+  with calls-per-token, to attribute a decode step across operators. `ncu` needs
+  GPU performance counters that containers typically withhold, so cost is
+  attributed by timing operators in isolation instead.
+- `test/benchmark_context.py` — the decode-throughput-vs-context sweep above.
 
 ## MetaX end-to-end verification
 

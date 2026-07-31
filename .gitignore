@@ -88,3 +88,6 @@ htmlcov/
 Thumbs.db
 ehthumbs.db
 desktop.ini
+# Remote GPU helper (local only)
+.remote.py
+.remote_config.json
