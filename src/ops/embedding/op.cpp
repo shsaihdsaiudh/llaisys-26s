@@ -26,7 +26,7 @@ void embedding(tensor_t out, tensor_t index, tensor_t weight) {
     if (cuda::isAvailableDevice(out->deviceType())) {
         llaisys::core::context().setDevice(out->deviceType(), out->deviceId());
         return cuda::embedding(out->data(), indices, weight->data(), out->dtype(),
-                               index->numel(), weight->shape()[1]);
+                               index->numel(), weight->shape()[1], weight->shape()[0]);
     }
 #endif
     CHECK_ARGUMENT(out->deviceType() == LLAISYS_DEVICE_CPU, "Unsupported embedding device");
