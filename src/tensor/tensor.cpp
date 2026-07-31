@@ -200,6 +200,8 @@ tensor_t Tensor::permute(const std::vector<size_t> &order) const {
 }
 
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
+    // numel with overflow checking: an overflowing product would wrap around
+    // to a small value and silently defeat the equality check below
     auto checked_numel = [](const std::vector<size_t> &dims) {
         size_t result = 1;
         for (const size_t dim : dims) {
@@ -217,6 +219,8 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
     std::vector<ptrdiff_t> new_strides(shape.size(), 1);
 
     if (old_numel == 0) {
+        // No elements to address, so any strides are equally valid: keep the old
+        // ones if the shape is unchanged, otherwise fall back to natural strides
         if (shape == this->shape()) {
             new_strides = this->strides();
         } else {
@@ -227,46 +231,80 @@ tensor_t Tensor::view(const std::vector<size_t> &shape) const {
             }
         }
     } else if (this->shape().empty()) {
+        // A scalar (0-d) can only be viewed as a single-element tensor ([1], [1,1], ...);
+        // new_strides stays at its default of all ones
         CHECK_ARGUMENT(new_numel == 1, "A scalar can only be viewed as a single-element tensor");
     } else {
-        ptrdiff_t view_dim = static_cast<ptrdiff_t>(shape.size()) - 1;
-        size_t tensor_numel = 1;
-        size_t view_numel = 1;
+        // General case: scan the old dims innermost-first and group them into
+        // "chunks" — runs of dims whose elements are evenly spaced in memory with
+        // one common base stride. Each time a chunk closes, pour new-shape dims
+        // (also innermost-first) into it until they cover exactly the chunk's
+        // element count. If they cannot line up, the old layout cannot be
+        // expressed by any strides under the new shape (e.g. flattening a
+        // transposed tensor), and the view is rejected.
+        //
+        // State (all advancing from the innermost dim outwards):
+        //   next_view_dim     - index of the next new-shape dim to assign
+        //   chunk_numel       - elements accumulated in the current old-tensor chunk
+        //   assigned_numel    - elements the assigned new dims cover within this chunk
+        //   chunk_base_stride - memory stride between adjacent elements in this chunk
+        ptrdiff_t next_view_dim = static_cast<ptrdiff_t>(shape.size()) - 1;
+        size_t chunk_numel = 1;
+        size_t assigned_numel = 1;
         ptrdiff_t chunk_base_stride = this->strides().back();
+
+        // A chunk closes right after tensor_dim unless the next outer dim
+        // continues it seamlessly, i.e. its stride equals (elements in the chunk
+        // so far) * (base stride). Size-1 dims never break a chunk: no step is
+        // ever taken along them, so their stride is irrelevant.
+        auto is_chunk_boundary = [&](size_t tensor_dim) {
+            if (tensor_dim == 0) {
+                return true; // the outermost dim always closes the current chunk
+            }
+            if (this->shape()[tensor_dim - 1] == 1) {
+                return false;
+            }
+            return this->strides()[tensor_dim - 1]
+                   != static_cast<ptrdiff_t>(chunk_numel) * chunk_base_stride;
+        };
 
         for (size_t i = this->ndim(); i > 0; --i) {
             const size_t tensor_dim = i - 1;
-            tensor_numel *= this->shape()[tensor_dim];
+            chunk_numel *= this->shape()[tensor_dim];
 
-            const bool chunk_boundary = tensor_dim == 0
-                                     || (this->shape()[tensor_dim - 1] != 1
-                                         && this->strides()[tensor_dim - 1]
-                                                != static_cast<ptrdiff_t>(tensor_numel) * chunk_base_stride);
-            if (!chunk_boundary) {
+            if (!is_chunk_boundary(tensor_dim)) {
                 continue;
             }
 
-            while (view_dim >= 0
-                   && (view_numel < tensor_numel || shape[static_cast<size_t>(view_dim)] == 1)) {
-                new_strides[static_cast<size_t>(view_dim)]
-                    = static_cast<ptrdiff_t>(view_numel) * chunk_base_stride;
-                view_numel *= shape[static_cast<size_t>(view_dim)];
-                --view_dim;
+            // The chunk is closed: pour new dims into it (innermost first,
+            // absorbing size-1 dims freely). Each new dim's stride is
+            // (elements covered inside it) * (chunk base stride).
+            while (next_view_dim >= 0
+                   && (assigned_numel < chunk_numel || shape[static_cast<size_t>(next_view_dim)] == 1)) {
+                new_strides[static_cast<size_t>(next_view_dim)]
+                    = static_cast<ptrdiff_t>(assigned_numel) * chunk_base_stride;
+                assigned_numel *= shape[static_cast<size_t>(next_view_dim)];
+                --next_view_dim;
             }
 
-            CHECK_ARGUMENT(view_numel == tensor_numel,
+            // The new dims must cover the chunk exactly: running out of new
+            // dims early or overshooting both mean the shapes do not line up
+            CHECK_ARGUMENT(assigned_numel == chunk_numel,
                            "View shape is incompatible with the tensor strides");
 
             if (tensor_dim > 0) {
+                // Start the next chunk, with the outer dim's stride as its base
                 chunk_base_stride = this->strides()[tensor_dim - 1];
-                tensor_numel = 1;
-                view_numel = 1;
+                chunk_numel = 1;
+                assigned_numel = 1;
             }
         }
 
-        CHECK_ARGUMENT(view_dim == -1, "View shape is incompatible with the tensor strides");
+        // All new dims must have been consumed by now
+        CHECK_ARGUMENT(next_view_dim == -1, "View shape is incompatible with the tensor strides");
     }
 
+    // Zero-copy: _storage and _offset are shared as-is; only the meta differs
     TensorMeta meta{this->dtype(), shape, std::move(new_strides)};
     return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, _offset));
 }
