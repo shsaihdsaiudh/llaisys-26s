@@ -101,14 +101,30 @@ class Qwen2:
         inputs: Sequence[int],
         max_new_tokens: int = None,
         top_k: int = 1,
-        top_p: float = 0.8,
-        temperature: float = 0.8,
+        top_p: float = 1.0,
+        temperature: float = 0.0,
     ):
+        """Greedy-decode `inputs` and return prompt + generated tokens.
+
+        Sampling is not implemented in the backend yet: the only accepted values
+        are the ones that reduce to greedy decoding. Anything else raises rather
+        than silently downgrading, so callers cannot believe they got sampling.
+        """
         if not inputs:
             raise ValueError("Qwen2 generation requires at least one input token")
         if top_k != 1:
-            raise ValueError("Qwen2 currently supports greedy decoding only (top_k=1)")
-        del top_p, temperature
+            raise ValueError(
+                f"Qwen2 backend supports greedy decoding only; got top_k={top_k} (expected 1)"
+            )
+        if temperature not in (0.0, 1.0):
+            raise ValueError(
+                f"Qwen2 backend supports greedy decoding only; got temperature={temperature} "
+                "(expected 0.0)"
+            )
+        if top_p != 1.0:
+            raise ValueError(
+                f"Qwen2 backend supports greedy decoding only; got top_p={top_p} (expected 1.0)"
+            )
 
         max_new_tokens = 128 if max_new_tokens is None else max_new_tokens
         if max_new_tokens < 0:
