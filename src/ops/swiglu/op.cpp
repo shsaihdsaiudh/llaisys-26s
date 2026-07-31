@@ -8,12 +8,14 @@
 #endif
 
 #include <cmath>
+#include <cstddef>
 
 namespace {
 template <typename T>
 void swiglu_cpu(T *out, const T *gate, const T *up, size_t count) {
 #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < count; ++i) {
+    for (ptrdiff_t signed_index = 0; signed_index < static_cast<ptrdiff_t>(count); ++signed_index) {
+        const size_t i = static_cast<size_t>(signed_index);
         const float gate_value = llaisys::utils::cast<float>(gate[i]);
         const float up_value = llaisys::utils::cast<float>(up[i]);
         const float silu = gate_value / (1.0F + std::exp(-gate_value));

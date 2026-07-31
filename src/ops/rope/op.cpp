@@ -8,6 +8,7 @@
 #endif
 
 #include <cmath>
+#include <cstddef>
 #include <vector>
 
 namespace {
@@ -25,19 +26,19 @@ void rope_cpu(T *out,
         frequency_divisor[i] = std::pow(theta, 2.0F * static_cast<float>(i) / static_cast<float>(head_dim));
     }
 
-#pragma omp parallel for collapse(2) schedule(static)
-    for (size_t token = 0; token < seq_len; ++token) {
-        for (size_t head = 0; head < heads; ++head) {
-            const size_t base = (token * heads + head) * head_dim;
-            for (size_t i = 0; i < half_dim; ++i) {
-                const float angle = static_cast<float>(pos_ids[token]) / frequency_divisor[i];
-                const float sine = std::sin(angle);
-                const float cosine = std::cos(angle);
-                const float a = llaisys::utils::cast<float>(in[base + i]);
-                const float b = llaisys::utils::cast<float>(in[base + half_dim + i]);
-                out[base + i] = llaisys::utils::cast<T>(a * cosine - b * sine);
-                out[base + half_dim + i] = llaisys::utils::cast<T>(b * cosine + a * sine);
-            }
+#pragma omp parallel for schedule(static)
+    for (ptrdiff_t flat = 0; flat < static_cast<ptrdiff_t>(seq_len * heads); ++flat) {
+        const size_t token = static_cast<size_t>(flat) / heads;
+        const size_t head = static_cast<size_t>(flat) % heads;
+        const size_t base = (token * heads + head) * head_dim;
+        for (size_t i = 0; i < half_dim; ++i) {
+            const float angle = static_cast<float>(pos_ids[token]) / frequency_divisor[i];
+            const float sine = std::sin(angle);
+            const float cosine = std::cos(angle);
+            const float a = llaisys::utils::cast<float>(in[base + i]);
+            const float b = llaisys::utils::cast<float>(in[base + half_dim + i]);
+            out[base + i] = llaisys::utils::cast<T>(a * cosine - b * sine);
+            out[base + half_dim + i] = llaisys::utils::cast<T>(b * cosine + a * sine);
         }
     }
 }

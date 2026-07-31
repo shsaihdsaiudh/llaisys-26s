@@ -8,12 +8,14 @@
 #endif
 
 #include <cmath>
+#include <cstddef>
 
 namespace {
 template <typename T>
 void rms_norm_cpu(T *out, const T *in, const T *weight, size_t rows, size_t width, float eps) {
 #pragma omp parallel for schedule(static)
-    for (size_t row = 0; row < rows; ++row) {
+    for (ptrdiff_t signed_row = 0; signed_row < static_cast<ptrdiff_t>(rows); ++signed_row) {
+        const size_t row = static_cast<size_t>(signed_row);
         float square_sum = 0.0F;
         for (size_t col = 0; col < width; ++col) {
             const float value = llaisys::utils::cast<float>(in[row * width + col]);

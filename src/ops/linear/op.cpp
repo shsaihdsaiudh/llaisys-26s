@@ -7,6 +7,8 @@
 #include "cuda/linear_cuda.hpp"
 #endif
 
+#include <cstddef>
+
 namespace {
 template <typename T>
 void linear_cpu(T *out,
@@ -16,16 +18,19 @@ void linear_cpu(T *out,
                 size_t rows,
                 size_t in_features,
                 size_t out_features) {
-#pragma omp parallel for collapse(2) schedule(static)
-    for (size_t row = 0; row < rows; ++row) {
-        for (size_t out_col = 0; out_col < out_features; ++out_col) {
-            float sum = bias == nullptr ? 0.0F : llaisys::utils::cast<float>(bias[out_col]);
-            for (size_t in_col = 0; in_col < in_features; ++in_col) {
-                sum += llaisys::utils::cast<float>(in[row * in_features + in_col])
-                     * llaisys::utils::cast<float>(weight[out_col * in_features + in_col]);
-            }
-            out[row * out_features + out_col] = llaisys::utils::cast<T>(sum);
+// MSVC implements OpenMP 2.0, which has no `collapse` and requires a signed
+// loop index, so the two output dimensions are flattened by hand into one
+// signed loop. Every OpenMP loop in the CPU kernels follows this shape.
+#pragma omp parallel for schedule(static)
+    for (ptrdiff_t flat = 0; flat < static_cast<ptrdiff_t>(rows * out_features); ++flat) {
+        const size_t row = static_cast<size_t>(flat) / out_features;
+        const size_t out_col = static_cast<size_t>(flat) % out_features;
+        float sum = bias == nullptr ? 0.0F : llaisys::utils::cast<float>(bias[out_col]);
+        for (size_t in_col = 0; in_col < in_features; ++in_col) {
+            sum += llaisys::utils::cast<float>(in[row * in_features + in_col])
+                 * llaisys::utils::cast<float>(weight[out_col * in_features + in_col]);
         }
+        out[row * out_features + out_col] = llaisys::utils::cast<T>(sum);
     }
 }
 } // namespace

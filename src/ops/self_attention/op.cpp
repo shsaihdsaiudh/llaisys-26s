@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <limits>
 #include <vector>
 
@@ -28,42 +29,42 @@ void self_attention_cpu(T *attn_val,
     const size_t queries_per_kv_head = query_heads / kv_heads;
     const size_t cached_tokens = kv_len - query_len;
 
-#pragma omp parallel for collapse(2) schedule(static)
-    for (size_t query_pos = 0; query_pos < query_len; ++query_pos) {
-        for (size_t query_head = 0; query_head < query_heads; ++query_head) {
-            const size_t kv_head = query_head / queries_per_kv_head;
-            const size_t visible_keys = cached_tokens + query_pos + 1;
-            std::vector<float> scores(visible_keys);
-            float max_score = -std::numeric_limits<float>::infinity();
+#pragma omp parallel for schedule(static)
+    for (ptrdiff_t flat = 0; flat < static_cast<ptrdiff_t>(query_len * query_heads); ++flat) {
+        const size_t query_pos = static_cast<size_t>(flat) / query_heads;
+        const size_t query_head = static_cast<size_t>(flat) % query_heads;
+        const size_t kv_head = query_head / queries_per_kv_head;
+        const size_t visible_keys = cached_tokens + query_pos + 1;
+        std::vector<float> scores(visible_keys);
+        float max_score = -std::numeric_limits<float>::infinity();
 
-            const size_t query_base = (query_pos * query_heads + query_head) * head_dim;
+        const size_t query_base = (query_pos * query_heads + query_head) * head_dim;
+        for (size_t key_pos = 0; key_pos < visible_keys; ++key_pos) {
+            const size_t key_base = (key_pos * kv_heads + kv_head) * head_dim;
+            float score = 0.0F;
+            for (size_t col = 0; col < head_dim; ++col) {
+                score += llaisys::utils::cast<float>(q[query_base + col])
+                       * llaisys::utils::cast<float>(k[key_base + col]);
+            }
+            score *= scale;
+            scores[key_pos] = score;
+            max_score = std::max(max_score, score);
+        }
+
+        float exp_sum = 0.0F;
+        for (float &score : scores) {
+            score = std::exp(score - max_score);
+            exp_sum += score;
+        }
+
+        const size_t output_base = (query_pos * query_heads + query_head) * value_dim;
+        for (size_t col = 0; col < value_dim; ++col) {
+            float result = 0.0F;
             for (size_t key_pos = 0; key_pos < visible_keys; ++key_pos) {
-                const size_t key_base = (key_pos * kv_heads + kv_head) * head_dim;
-                float score = 0.0F;
-                for (size_t col = 0; col < head_dim; ++col) {
-                    score += llaisys::utils::cast<float>(q[query_base + col])
-                           * llaisys::utils::cast<float>(k[key_base + col]);
-                }
-                score *= scale;
-                scores[key_pos] = score;
-                max_score = std::max(max_score, score);
+                const size_t value_base = (key_pos * kv_heads + kv_head) * value_dim;
+                result += scores[key_pos] * llaisys::utils::cast<float>(v[value_base + col]);
             }
-
-            float exp_sum = 0.0F;
-            for (float &score : scores) {
-                score = std::exp(score - max_score);
-                exp_sum += score;
-            }
-
-            const size_t output_base = (query_pos * query_heads + query_head) * value_dim;
-            for (size_t col = 0; col < value_dim; ++col) {
-                float result = 0.0F;
-                for (size_t key_pos = 0; key_pos < visible_keys; ++key_pos) {
-                    const size_t value_base = (key_pos * kv_heads + kv_head) * value_dim;
-                    result += scores[key_pos] * llaisys::utils::cast<float>(v[value_base + col]);
-                }
-                attn_val[output_base + col] = llaisys::utils::cast<T>(result / exp_sum);
-            }
+            attn_val[output_base + col] = llaisys::utils::cast<T>(result / exp_sum);
         }
     }
 }
