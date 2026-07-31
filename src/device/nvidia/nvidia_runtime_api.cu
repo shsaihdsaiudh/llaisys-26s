@@ -18,6 +18,18 @@ void checkCuda(cudaError_t status, const char *operation) {
     throw std::runtime_error(message.str());
 }
 
+// Teardown operations run from destructors, which may execute after the CUDA
+// runtime has begun unloading at process exit. `cudaErrorCudartUnloading` means
+// the runtime is already gone, so the resource this call would have released no
+// longer exists and the call is a successful no-op. Any other status is a real
+// failure and still throws.
+void checkCudaTeardown(cudaError_t status, const char *operation) {
+    if (status == cudaErrorCudartUnloading) {
+        return;
+    }
+    checkCuda(status, operation);
+}
+
 cudaMemcpyKind memcpyKind(llaisysMemcpyKind_t kind) {
     switch (kind) {
     case LLAISYS_MEMCPY_H2H:
@@ -41,7 +53,8 @@ int getDeviceCount() {
 }
 
 void setDevice(int device) {
-    checkCuda(cudaSetDevice(device), "cudaSetDevice");
+    // Also reached from Runtime's destructor at process exit.
+    checkCudaTeardown(cudaSetDevice(device), "cudaSetDevice");
 }
 
 void deviceSynchronize() {
@@ -56,7 +69,7 @@ llaisysStream_t createStream() {
 
 void destroyStream(llaisysStream_t stream) {
     if (stream != nullptr) {
-        checkCuda(cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream)), "cudaStreamDestroy");
+        checkCudaTeardown(cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream)), "cudaStreamDestroy");
     }
 }
 void streamSynchronize(llaisysStream_t stream) {
@@ -74,7 +87,7 @@ void *mallocDevice(size_t size) {
 
 void freeDevice(void *ptr) {
     if (ptr != nullptr) {
-        checkCuda(cudaFree(ptr), "cudaFree");
+        checkCudaTeardown(cudaFree(ptr), "cudaFree");
     }
 }
 
@@ -89,7 +102,7 @@ void *mallocHost(size_t size) {
 
 void freeHost(void *ptr) {
     if (ptr != nullptr) {
-        checkCuda(cudaFreeHost(ptr), "cudaFreeHost");
+        checkCudaTeardown(cudaFreeHost(ptr), "cudaFreeHost");
     }
 }
 
