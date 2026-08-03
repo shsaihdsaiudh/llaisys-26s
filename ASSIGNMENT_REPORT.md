@@ -498,41 +498,64 @@ needed re-measurement.
   attributed by timing operators in isolation instead.
 - `test/benchmark_context.py` — the decode-throughput-vs-context sweep above.
 
-### The bottleneck is not the same on both platforms
+### Per-launch cost differs by 2.8×, but MetaX is still GPU-bound
 
 Everything above was measured on the 4090, where profiling showed decode to be
 weight-bandwidth-bound and explicitly *retired* kernel-launch count as a target.
-Re-running the same experiments on MetaX C500 (32 GB sGPU quota, 50% compute)
-shows that conclusion is platform-specific, and inverts there.
+The natural question is whether that conclusion transfers to MetaX C500 (32 GB
+sGPU quota, 50% compute). Per-launch latency there really is much worse — batching
+N one-element `add` calls behind a single synchronization and dividing gives:
 
-The per-launch cost differs by 2.8×. Batching N one-element `add` calls behind a
-single synchronization and dividing gives the marginal cost of a launch:
+| platform | per-launch, isolated | × ~508 launches/token | single-token pass |
+| --- | --- | --- | --- |
+| RTX 4090 | 2.36 µs | 1.20 ms | 4.93 ms |
+| MetaX C500 | 6.54 µs | 3.32 ms | 6.56 ms |
 
-| platform | per-launch | × ~508 launches/token | single-token pass | launch share |
-| --- | --- | --- | --- | --- |
-| RTX 4090 | 2.36 µs | 1.20 ms | 4.93 ms | 24% (hidden under 3.53 ms of work) |
-| MetaX C500 | 6.54 µs | 3.32 ms | 6.56 ms | **51%** |
+**That table invites a conclusion it does not support, and the first version of
+this section drew it** — 3.32 ms of 6.56 ms reads as "51% launch-bound, so fusion
+and graph capture are the opportunity here." That inference is wrong, and it is
+wrong in exactly the way the methodology section above warns about: an isolated
+per-call measurement is a *round trip*, and round trips overlap when 500 of them
+are issued back to back. Multiplying a latency by a count assumes serialization
+that does not occur.
 
-On the 4090 the host stays comfortably ahead of the device, so launch count is
-free. On C500 more than half of a decode step is launch overhead, so **launch
-count is the dominant cost there** — the optimization that measurement correctly
-rejected for NVIDIA is the main opportunity for MetaX. Kernel fusion and CUDA/MC
-graph capture, both no-ops on the 4090, would target this directly.
+The direct test is to time the host's issue phase separately from the wall clock
+over the real 28-layer decode body:
 
-The same batching sweep exposes the floor per call:
+```
+issue (no sync)  3.248 ms for 420 launches = 7.73 µs/launch of host time
+wall (with sync) 7.420 ms
+host finishes issuing at 44% of the wall clock
+```
+
+The host runs **ahead** by 4.17 ms, so the queue never starves the device: C500 is
+GPU-bound, like the 4090, despite the 2.8× worse launch latency. Cutting launch
+count would buy little, and the honest ceiling for fusing away every reducible
+launch — the 2 residual adds, swiglu, and the 2 ropes, 140 of 420 — is bounded by
+host time that is already hidden. **So the NVIDIA conclusion does transfer, and
+kernel fusion and graph capture were retired again, on evidence rather than by
+analogy.** MACA does expose the full graph API (`mcStreamBeginCapture`,
+`mcGraphInstantiate`, `mcGraphLaunch`), so this was a deliberate decision not to
+use it, not a limitation; separately, all kernels currently launch on the default
+stream, so capture would have required threading a stream through all eight ops
+first.
+
+What differs between the platforms is therefore the *margin*, not the bottleneck:
+the 4090's host runs ahead by more. The practical consequence is for the
+measurement harness rather than the kernels.
 
 ```
 add (1x1536 bf16), N calls behind one sync — per-call µs on C500
 N=1   40.46      N=8   17.48      N=64   7.55      N=256  6.80
 ```
 
-A single timed call costs 40 µs, but the marginal cost converges to ~6.8 µs,
-matching the launch overhead above. `benchmark_ops.py` times one call per sample
-and so reports the 40 µs figure; its modelled total of 17.9 ms/token overstates
-the measured ~4.8 ms/token by 3.7× on this platform. **The harness is sound on
-NVIDIA and misleading on MetaX**, because it assumes per-call latency is small
-relative to kernel time. It is used here only for relative op ranking, and the
-end-to-end numbers below come from `benchmark_context.py`.
+A single timed call costs 40 µs, but the marginal cost converges to ~6.8 µs.
+`benchmark_ops.py` times one call per sample and so reports the 40 µs figure; its
+modelled total of 17.9 ms/token overstates the measured ~4.8 ms/token by 3.7× on
+this platform. **The harness is sound on NVIDIA and misleading on MetaX**, because
+it assumes per-call latency is small relative to kernel time. It is used here only
+for relative op ranking; the end-to-end numbers below come from
+`benchmark_context.py`.
 
 Flash-decoding does carry over, and the baseline switch makes the ratio measurable
 on this platform too. Both sweeps at `--steps 128 --repeats 3`:
