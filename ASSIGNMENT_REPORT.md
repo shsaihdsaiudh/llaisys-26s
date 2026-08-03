@@ -85,12 +85,16 @@ optimization lands in one place.
 
 ## MetaX environment
 
-- GPU: MetaX C500, 16 GB sGPU quota, 25% compute quota
+Two C500 hosts were used. The optimization measurements and the TF32 finding come
+from the second, which has a larger quota:
+
+- GPU: MetaX C500 — host A: 16 GB sGPU quota, 25% compute; host B: 32 GB sGPU
+  quota, 50% compute, 128 cores
 - Driver: 3.8.30
 - MACA: 3.3.0.15
 - MXCC: 1.0.0
 - OS: Ubuntu 24.04.1 LTS
-- Xmake: 3.0.9
+- Xmake: 3.0.9 (host B: 3.0.9, run with `XMAKE_ROOT=y` as the container is root)
 - Python: 3.10.10
 - PyTorch: 2.8.0+metax3.3.0.2
 
@@ -152,6 +156,34 @@ The same runtime suite, all eight operator suites, and the Qwen2 loader/KV-cache
 reference suite passed on MetaX with `--device metax`. Coverage includes real
 Qwen2 decode geometry (`12` query heads, `2` KV heads, head dimension `128`),
 KV lengths `1`, `256`, and `257`, and the `151,936`-element argmax workload.
+
+### The f32 reference was TF32, not f32
+
+On a second C500 host the `linear` and `self_attention` f32 cases failed, by about
+2e-4 relative — too coarse for fp32 on those shapes, which pointed at the
+reference rather than the kernels. Torch defaults `allow_tf32` to True, so every
+f32 matmul reference was running in TF32's 10-bit mantissa while the kernels
+accumulate in fp32.
+
+A float64 CPU computation arbitrates, since it is neutral between the two:
+
+| case | our MACA kernel | torch on MACA | who is wrong |
+| --- | --- | --- | --- |
+| `self_attention` 2×2×1×1×4 f32 | 1.071e-08 | 1.397e-04 | the reference, by 13,000× |
+| `linear` 512×4096×4096 f32 | 5.069e-06 | 3.394e-05 | the reference, by 6.7× |
+
+The kernels were the accurate side in both cases; checking a 1e-8 result against a
+1e-4 reference at a 1e-5 tolerance fails the kernel for the reference's error.
+`test/test_utils.py` now disables TF32 for the whole suite, after which all eight
+operator suites pass on metax; re-enabling it reproduces the failures, which
+confirms the cause rather than assuming it. **The tolerances were not touched**, so
+the tests are not weakened — the comparison is simply now against true fp32.
+
+This was surfaced only by verifying on a second platform: this MACA build reports
+`torch.backends.cuda.matmul.allow_tf32 == True`. Whether the NVIDIA host had the
+same default was not re-checked — that host was no longer available — so the
+harness now sets the flag explicitly rather than relying on any vendor's default,
+which makes the suite correct on both platforms either way.
 
 ## End-to-end inference
 
@@ -271,6 +303,16 @@ and 128-step exact-match tests still pass.
 The equivalent MACA change was deliberately not made: the MetaX host was not
 reachable to confirm the enumerator's name, and guessing it would risk exactly
 the kind of unverified-platform build break described under platform status.
+
+That deferral has since been resolved on hardware, and the answer was that no
+port should be made. Two facts settle it. MACA has no `cudaErrorCudartUnloading`
+equivalent — `/opt/maca/include/mcr/mc_runtime_types.h` defines
+`mcErrorDeinitialized = 4` and nothing named for runtime unloading — so the
+guessed enumerator would not have compiled. More decisively, MetaX does not
+exhibit the symptom: `test_runtime.py --device metax` and a Qwen2 generate both
+exit cleanly with no teardown diagnostic and status 0. Adding a MACA teardown
+exemption would therefore suppress a class of error that this platform reports
+only when it is real. The asymmetry is recorded rather than papered over.
 
 ## Profile-guided optimization
 
@@ -428,6 +470,68 @@ needed re-measurement.
   GPU performance counters that containers typically withhold, so cost is
   attributed by timing operators in isolation instead.
 - `test/benchmark_context.py` — the decode-throughput-vs-context sweep above.
+
+### The bottleneck is not the same on both platforms
+
+Everything above was measured on the 4090, where profiling showed decode to be
+weight-bandwidth-bound and explicitly *retired* kernel-launch count as a target.
+Re-running the same experiments on MetaX C500 (32 GB sGPU quota, 50% compute)
+shows that conclusion is platform-specific, and inverts there.
+
+The per-launch cost differs by 2.8×. Batching N one-element `add` calls behind a
+single synchronization and dividing gives the marginal cost of a launch:
+
+| platform | per-launch | × ~508 launches/token | single-token pass | launch share |
+| --- | --- | --- | --- | --- |
+| RTX 4090 | 2.36 µs | 1.20 ms | 4.93 ms | 24% (hidden under 3.53 ms of work) |
+| MetaX C500 | 6.54 µs | 3.32 ms | 6.56 ms | **51%** |
+
+On the 4090 the host stays comfortably ahead of the device, so launch count is
+free. On C500 more than half of a decode step is launch overhead, so **launch
+count is the dominant cost there** — the optimization that measurement correctly
+rejected for NVIDIA is the main opportunity for MetaX. Kernel fusion and CUDA/MC
+graph capture, both no-ops on the 4090, would target this directly.
+
+The same batching sweep exposes the floor per call:
+
+```
+add (1x1536 bf16), N calls behind one sync — per-call µs on C500
+N=1   40.46      N=8   17.48      N=64   7.55      N=256  6.80
+```
+
+A single timed call costs 40 µs, but the marginal cost converges to ~6.8 µs,
+matching the launch overhead above. `benchmark_ops.py` times one call per sample
+and so reports the 40 µs figure; its modelled total of 17.9 ms/token overstates
+the measured ~4.8 ms/token by 3.7× on this platform. **The harness is sound on
+NVIDIA and misleading on MetaX**, because it assumes per-call latency is small
+relative to kernel time. It is used here only for relative op ranking, and the
+end-to-end numbers below come from `benchmark_context.py`.
+
+Flash-decoding does carry over. The context sweep at `--steps 128 --repeats 3`:
+
+| context | ms/token | ± | tok/s |
+| --- | --- | --- | --- |
+| 128 | 10.184 | 0.017 | 98.2 |
+| 512 | 15.466 | 2.032 | 64.7 |
+| 1024 | 12.423 | 1.044 | 80.5 |
+| 2048 | 12.466 | 3.681 | 80.2 |
+| 4096 | *unreliable* | — | — |
+
+Cost is flat from 1024 to 2048 (12.42 vs 12.47, well inside the spread), which is
+the same signature the 4090 showed once attention stopped serializing — so the
+split-KV kernel is doing its job on MACA without retuning, despite the 512-element
+split and `MAX_BLOCKS = 256` having been chosen for a 128-SM NVIDIA part.
+
+Two honest caveats. This sGPU is far noisier than the dedicated 4090 (±3.7 ms at
+2048, versus ±0.2 ms for the same measurement on NVIDIA), and the 512 row sits
+above the 1024 row, which is not physical — with a ±2.0 ms spread the two rows
+overlap, so the ordering is noise rather than a regression. The 4096 row was
+withheld entirely: the `UnreliableMeasurement` guard fired because the 1568 ms
+signal did not clear 3× the 1186 ms spread. That guard doing its job on a second,
+noisier platform is itself the useful result — the alternative was a fabricated
+number of exactly the kind the methodology section above was written to prevent.
+Establishing a baseline-vs-optimized ratio on C500 needs either a dedicated card
+or many more repeats, and is not claimed here.
 
 ## MetaX end-to-end verification
 
