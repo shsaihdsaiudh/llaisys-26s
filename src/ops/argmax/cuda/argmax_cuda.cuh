@@ -107,6 +107,18 @@ __global__ void argmaxSingleKernel(int64_t *max_index, T *max_value, const T *va
 template <typename T>
 void launch(int64_t *max_index, std::byte *max_value, const std::byte *values, size_t count) {
     const auto *typed = reinterpret_cast<const T *>(values);
+
+#ifdef LLAISYS_BASELINE_KERNELS
+    // Pre-optimization behaviour, retained so the report's comparison can be
+    // regenerated: always one block, whatever the input size. On a 128-SM GPU
+    // that leaves 127 SMs idle and reached 2.8 GB/s over 151,936 logits. The
+    // single-block kernel below is the same code the baseline ran, so the
+    // difference measured is purely the launch geometry.
+    argmaxSingleKernel<<<1, BLOCK_SIZE>>>(max_index, reinterpret_cast<T *>(max_value),
+                                          typed, count);
+    checkKernel("argmax kernel");
+    return;
+#else
     const size_t needed = (count + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // Below this the kernel-launch overhead dominates the scan, so staying in a
@@ -127,6 +139,7 @@ void launch(int64_t *max_index, std::byte *max_value, const std::byte *values, s
     argmaxFinalKernel<<<1, BLOCK_SIZE>>>(max_index, reinterpret_cast<T *>(max_value),
                                          typed, blocks);
     checkKernel("argmax final kernel");
+#endif
 }
 } // namespace
 

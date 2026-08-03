@@ -106,6 +106,12 @@ __global__ void attentionValuesKernel(T *out, const float *scores, const T *valu
     out[index] = fromFloat<T>(result);
 }
 
+#ifdef LLAISYS_BASELINE_KERNELS
+// Brings in launchBaselineDecode. Included here, inside the anonymous namespace,
+// because the fragment uses attentionScore above.
+#include "self_attention_baseline.cuh"
+#endif
+
 // Sums `value` across the 32 lanes of a warp without any shared memory or
 // barriers. Used instead of a shared-memory tree so the per-key dot products do
 // not pay a __syncthreads each.
@@ -451,6 +457,12 @@ void launch(std::byte *out, const std::byte *query, const std::byte *key,
             size_t query_heads, size_t kv_heads, size_t head_dimension,
             size_t value_dimension, float scale) {
     if (query_length == 1) {
+#ifdef LLAISYS_BASELINE_KERNELS
+        // One block per query head at every context length — the geometry that
+        // flash-decoding replaced. See self_attention_baseline.cuh.
+        return launchBaselineDecode<T>(out, query, key, value, kv_length, query_heads,
+                                       kv_heads, head_dimension, value_dimension, scale);
+#else
         // A block per query head is only 12 blocks for Qwen2-1.5B, so once the
         // context is long enough to matter, split the key range to fill the GPU.
         // Below that the split's combine pass costs more than it saves.
@@ -463,6 +475,7 @@ void launch(std::byte *out, const std::byte *query, const std::byte *key,
         }
         return launchDecode<T>(out, query, key, value, kv_length, query_heads,
                                kv_heads, head_dimension, value_dimension, scale);
+#endif
     }
 
     constexpr int threads = 256;

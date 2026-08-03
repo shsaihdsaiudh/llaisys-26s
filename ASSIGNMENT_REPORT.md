@@ -405,7 +405,34 @@ Attention is the one part of decode that grows with context, so a short-prompt
 benchmark hides it: at `kv=90` attention is ~13% of a token and a faster kernel
 barely moves the total. `test/benchmark_context.py` sweeps the starting context.
 Baseline here means this tree with the four pre-optimization kernels restored, so
-the comparison isolates the kernel work from every other change:
+the comparison isolates the kernel work from every other change.
+
+That baseline is a build option rather than a manual edit, so the table can be
+regenerated instead of taken on trust:
+
+```bash
+xmake f --metax-gpu=y --use-mc=y --nv-gpu=n --baseline-kernels=y -m release -c
+xmake && xmake install
+python test/benchmark_context.py --model <model> --device metax \
+    --contexts 128,512,1024,2048 --steps 128 --repeats 3 --tag baseline
+```
+
+`--baseline-kernels=y` defines `LLAISYS_BASELINE_KERNELS`, which selects the
+pre-optimization `argmax` (always one block) and `rope` (per-element trig) inside
+their existing headers, and the pre-flash-decoding attention kernel from
+`src/ops/self_attention/cuda/self_attention_baseline.cuh`. The option is off by
+default and the baseline path is never compiled into a normal build.
+
+Two things are deliberately *not* under the switch. The `embedding` optimization
+is excluded because the same commit fixed an out-of-bounds read, and restoring it
+to benchmark would reintroduce a memory-safety bug for the sake of a number; its
+1.53× is reported from the original measurement and is not regenerable this way.
+And the baseline build is verified for **correctness**, not just speed — the
+`argmax`, `rope`, and `self_attention` suites all pass with it enabled, which is
+what makes it a fair comparison rather than a comparison against something
+broken. Measured on C500 at `kv=128`, the switch moves `argmax` from 62.3 to
+439.5 µs and decode `self_attention` from 90.8 to 184.5 µs, confirming it selects
+the intended code.
 
 | context | baseline ms/token | optimized ms/token | speedup |
 | --- | --- | --- | --- |
@@ -507,31 +534,34 @@ NVIDIA and misleading on MetaX**, because it assumes per-call latency is small
 relative to kernel time. It is used here only for relative op ranking, and the
 end-to-end numbers below come from `benchmark_context.py`.
 
-Flash-decoding does carry over. The context sweep at `--steps 128 --repeats 3`:
+Flash-decoding does carry over, and the baseline switch makes the ratio measurable
+on this platform too. Both sweeps at `--steps 128 --repeats 3`:
 
-| context | ms/token | ± | tok/s |
+| context | baseline ms/token | optimized ms/token | speedup |
 | --- | --- | --- | --- |
-| 128 | 10.184 | 0.017 | 98.2 |
-| 512 | 15.466 | 2.032 | 64.7 |
-| 1024 | 12.423 | 1.044 | 80.5 |
-| 2048 | 12.466 | 3.681 | 80.2 |
-| 4096 | *unreliable* | — | — |
+| 128 | 16.409 ± 0.043 | 10.184 ± 0.017 | 1.61× |
+| 512 | 28.310 ± 0.612 | 15.466 ± 2.032 | 1.83× |
+| 1024 | 43.696 ± 1.810 | 12.423 ± 1.044 | 3.52× |
+| 2048 | 74.271 ± 3.794 | 12.466 ± 3.681 | **5.96×** |
 
-Cost is flat from 1024 to 2048 (12.42 vs 12.47, well inside the spread), which is
-the same signature the 4090 showed once attention stopped serializing — so the
-split-KV kernel is doing its job on MACA without retuning, despite the 512-element
-split and `MAX_BLOCKS = 256` having been chosen for a 128-SM NVIDIA part.
+The optimized curve is flat from 1024 to 2048 (12.42 vs 12.47, well inside the
+spread) while the baseline keeps roughly doubling — the same signature the 4090
+showed. So the split-KV kernel works on MACA **without retuning**, despite the
+512-element split and `MAX_BLOCKS = 256` having been chosen for a 128-SM NVIDIA
+part. The C500 speedups at 1024 and 2048 (3.52× and 5.96×) even exceed the 4090's
+at the same contexts (1.48× and 2.02×), which follows from the baseline being
+worse here: serializing attention on 12 blocks hurts more on a 50%-quota sGPU.
 
-Two honest caveats. This sGPU is far noisier than the dedicated 4090 (±3.7 ms at
-2048, versus ±0.2 ms for the same measurement on NVIDIA), and the 512 row sits
-above the 1024 row, which is not physical — with a ±2.0 ms spread the two rows
-overlap, so the ordering is noise rather than a regression. The 4096 row was
-withheld entirely: the `UnreliableMeasurement` guard fired because the 1568 ms
-signal did not clear 3× the 1186 ms spread. That guard doing its job on a second,
-noisier platform is itself the useful result — the alternative was a fabricated
-number of exactly the kind the methodology section above was written to prevent.
-Establishing a baseline-vs-optimized ratio on C500 needs either a dedicated card
-or many more repeats, and is not claimed here.
+Caveats, since this host is noisier than the dedicated 4090. The optimized 512 row
+sits above the 1024 row, which is not physical — with a ±2.0 ms spread the two
+overlap, so that ordering is noise, not a regression. The ± on the optimized 2048
+row (±3.68 ms) is nearly a third of its value, so treat 5.96× as approximate; the
+baseline rows are much tighter and the direction of the effect is not in doubt.
+The 4096 row was withheld entirely on the optimized build: the
+`UnreliableMeasurement` guard fired because the 1568 ms signal did not clear 3×
+the 1186 ms spread. That guard doing its job on a second, noisier platform is
+itself a useful result — the alternative was a fabricated number of exactly the
+kind the methodology section above was written to prevent.
 
 ## MetaX end-to-end verification
 

@@ -44,6 +44,19 @@ if has_config("metax-gpu") then
     includes("xmake/metax.lua")
 end
 
+-- Pre-optimization kernels, kept so the performance comparison in
+-- ASSIGNMENT_REPORT.md can be regenerated rather than described. Off by default;
+-- a baseline build is never what you want for real use.
+option("baseline-kernels")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Build the pre-optimization argmax/rope/self_attention kernels for benchmarking")
+option_end()
+
+if has_config("baseline-kernels") then
+    add_defines("LLAISYS_BASELINE_KERNELS")
+end
+
 target("llaisys-utils")
     set_kind("static")
 
