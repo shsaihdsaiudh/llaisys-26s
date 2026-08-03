@@ -1,6 +1,16 @@
 import llaisys
 import torch
 
+# The reference has to be at least as precise as the kernel it judges. Torch
+# defaults `allow_tf32` to True, so an f32 matmul reference silently runs in
+# TF32 (10-bit mantissa) and lands ~1e-4 off the true result, while our kernels
+# accumulate in fp32 and land ~1e-8 off. Comparing them at the f32 tolerance of
+# 1e-5 then fails the *kernel* for the reference's error: measured against a
+# float64 CPU arbiter on MetaX C500, torch was 1.40e-04 off on the 2x2x1x1x4
+# self-attention case where our kernel was 1.07e-08 off. Ask for true fp32.
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
 
 def random_tensor(
     shape, dtype_name, device_name, device_id=0, scale=None, bias=None
